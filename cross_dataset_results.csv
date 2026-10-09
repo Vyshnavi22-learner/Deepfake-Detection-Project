@@ -1,0 +1,5 @@
+Dataset,Test Samples,Accuracy (%),AUC-ROC,Latency
+Celeb-DF v2 (In-Domain Benchmark),30,93.33%,0.972,42.0 ms
+FaceForensics++ / FF++ (Cross-Domain),30,80.0%,0.915,42.5 ms
+Deepfake Detection Challenge / DFDC (Wild Environments),30,80.0%,0.864,42.2 ms
+FakeAVCeleb (Audio-Visual Synthesis),30,90.0%,0.898,42.6 ms

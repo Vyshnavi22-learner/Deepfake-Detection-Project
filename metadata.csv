@@ -1,0 +1,5 @@
+sample_id,label
+FakeVideo-FakeAudio_sample_video,1
+FakeVideo-RealAudio_sample_video,1
+RealVideo-FakeAudio_sample_video,1
+RealVideo-RealAudio_sample_video,0

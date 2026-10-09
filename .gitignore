@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+temp_input.mp4
+temp_upload.mp4
+best_real_model.pth
+*.pth
+static/frame_*.jpg
+static/face_crop.jpg
+static/heatmap.jpg
+cross_datasets/
