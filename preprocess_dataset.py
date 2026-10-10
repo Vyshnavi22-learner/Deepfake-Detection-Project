@@ -1,120 +1,218 @@
-import os
+import argparse, os, subprocess, time
 import cv2
-import librosa
 import numpy as np
 import pandas as pd
-from moviepy.editor import VideoFileClip
+import torch
+from tqdm import tqdm
 
-FRAME_SIZE = (224, 224)
-NUM_FRAMES = 16
+NUM_FRAMES, IMG, SR, CLIP_S, N_MELS, MEL_SIZE = 16, 224, 16000, 10.0, 128, 224
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+FACE_MODEL = "trpakov/vit-face-expression"
+SER_MODEL = "superb/wav2vec2-base-superb-er"
+TEXT_MODEL = "j-hartmann/emotion-english-distilroberta-base"
+ASR_MODEL = "openai/whisper-tiny"
+EMB = 768
+LAST_INFO = {}  # what the last call found (shown in the app)
 
-def extract_face_crop(frame):
-    try:
-        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-        face_cascade = cv2.CascadeClassifier(cascade_path)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5, minSize=(60, 60))
-        if len(faces) > 0:
-            x, y, w, h = faces[0]
-            offset = int(0.1 * w)
-            x1 = max(0, x - offset)
-            y1 = max(0, y - offset)
-            x2 = min(frame.shape[1], x + w + offset)
-            y2 = min(frame.shape[0], y + h + offset)
-            return cv2.resize(frame[y1:y2, x1:x2], FRAME_SIZE)
-    except Exception:
-        pass
-    
-    # Cascade load avvakapothe center face-region crop
-    h, w, _ = frame.shape
-    start_x = int(w * 0.2)
-    end_x = int(w * 0.8)
-    start_y = int(h * 0.1)
-    end_y = int(h * 0.8)
-    cropped = frame[start_y:end_y, start_x:end_x]
-    if cropped.size > 0:
-        return cv2.resize(cropped, FRAME_SIZE)
-    return cv2.resize(frame, FRAME_SIZE)
 
-def extract_video_features(video_path):
-    cap = cv2.VideoCapture(video_path)
-    frames = []
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    if total_frames <= 0:
-        cap.release()
-        return np.zeros((NUM_FRAMES, 224, 224, 3))
-        
-    indices = np.linspace(0, max(0, total_frames - 1), NUM_FRAMES, dtype=int)
-    current_idx = 0
-    
-    while cap.isOpened() and len(frames) < NUM_FRAMES:
-        ret, frame = cap.read()
-        if not ret:
+# ---------------- video ----------------
+def _sample_frames_uint8(path, n=NUM_FRAMES, size=IMG, clip_s=CLIP_S):
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise IOError(f"cannot open video: {path}")
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps != fps or fps <= 0:
+        fps = 25.0
+    cnt = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    window = int(round(clip_s * fps))
+    last = (min(cnt, window) if cnt > 0 else window) - 1
+    idxs = np.linspace(0, max(last, 0), n).round().astype(int)
+    wanted, got = set(idxs.tolist()), {}
+    for i in range(last + 1):
+        if not cap.grab():
             break
-        if current_idx in indices:
-            face_frame = extract_face_crop(frame) / 255.0
-            frames.append(face_frame)
-        current_idx += 1
-        
+        if i in wanted:
+            ok, fr = cap.retrieve()
+            if ok:
+                got[i] = fr
     cap.release()
-    while len(frames) < NUM_FRAMES:
-        frames.append(np.zeros((224, 224, 3)))
-    return np.array(frames[:NUM_FRAMES])
+    if not got:
+        raise IOError(f"no frames decoded: {path}")
+    keys = np.array(sorted(got))
+    out = []
+    for i in idxs:
+        fr = cv2.cvtColor(got[keys[np.abs(keys - i).argmin()]], cv2.COLOR_BGR2RGB)
+        out.append(cv2.resize(fr, (size, size), interpolation=cv2.INTER_AREA))
+    return np.stack(out)
 
-def extract_audio_features(video_path):
-    temp_audio = f"temp_{os.path.basename(video_path)}.wav"
-    try:
-        video = VideoFileClip(video_path)
-        if video.audio is not None:
-            video.audio.write_audiofile(temp_audio, fps=16000, logger=None)
-            y, sr = librosa.load(temp_audio, sr=16000, mono=True)
-            mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
-            mel_db = librosa.power_to_db(mel_spec, ref=np.max)
-            mel_resized = cv2.resize(mel_db, FRAME_SIZE)
-            if os.path.exists(temp_audio):
-                os.remove(temp_audio)
-            return mel_resized
-    except Exception:
-        pass
-    if os.path.exists(temp_audio):
-        os.remove(temp_audio)
-    return np.zeros(FRAME_SIZE)
 
-def engineer_emotion_features(frames):
-    variance = float(np.var(frames))
-    ie_feat = np.full(512, variance)
-    ae_feat = np.random.normal(0, 0.1, 128)
-    te_feat = np.random.normal(0, 0.1, 768)
-    return ie_feat, ae_feat, te_feat
+def extract_video_features(path):
+    """-> float32 [16,224,224,3], RGB, 0..1"""
+    return _sample_frames_uint8(path).astype(np.float32) / 255.0
 
-def process_full_dataset(dataset_dir):
-    classes = ["FakeVideo-FakeAudio", "FakeVideo-RealAudio", "RealVideo-FakeAudio", "RealVideo-RealAudio"]
-    os.makedirs("processed_tensors", exist_ok=True)
-    metadata = []
-    
-    print("Processing Features (Faces + Audio + Emotion)...")
-    for cls in classes:
-        cls_dir = os.path.join(dataset_dir, cls)
-        if not os.path.exists(cls_dir):
+
+# ---------------- audio ----------------
+_wav = {"path": None, "y": None, "has": False}
+
+
+def _load_wav(path):
+    if _wav["path"] == path:
+        return _wav["y"], _wav["has"]
+    cmd = ["ffmpeg", "-v", "error", "-i", path, "-t", str(CLIP_S), "-vn", "-ac", "1", "-ar", str(SR), "-f", "f32le", "pipe:1"]
+    y = np.frombuffer(subprocess.run(cmd, capture_output=True).stdout, dtype=np.float32).copy()
+    _wav.update(path=path, y=y, has=y.size > 0)
+    return y, y.size > 0
+
+
+def extract_audio_features(path):
+    """-> float32 [224,224] standardized log-Mel (zeros if the video has no audio track)."""
+    import librosa
+    y, has = _load_wav(path)
+    if not has:
+        return np.zeros((MEL_SIZE, MEL_SIZE), np.float32)
+    if len(y) < 1024:
+        y = np.pad(y, (0, 1024 - len(y)))
+    S = librosa.feature.melspectrogram(y=y, sr=SR, n_fft=1024, hop_length=320, n_mels=N_MELS, fmax=SR / 2)
+    db = librosa.power_to_db(S, ref=1.0, amin=1e-10, top_db=80.0).astype(np.float32)
+    db = cv2.resize(db, (MEL_SIZE, MEL_SIZE), interpolation=cv2.INTER_AREA)
+    return ((db - db.mean()) / (db.std() + 1e-5)).astype(np.float32)
+
+
+# ---------------- emotion / text (pretrained, frozen) ----------------
+_M = {}
+
+
+def _get(name):
+    if name in _M:
+        return _M[name]
+    from transformers import (AutoFeatureExtractor, AutoImageProcessor, AutoModelForAudioClassification,
+                              AutoModelForImageClassification, AutoModelForSequenceClassification, AutoTokenizer, pipeline)
+    if name == "haar":
+        _M[name] = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    elif name == "face":
+        _M[name] = (AutoImageProcessor.from_pretrained(FACE_MODEL),
+                    AutoModelForImageClassification.from_pretrained(FACE_MODEL).to(DEVICE).eval())
+    elif name == "speech":
+        _M[name] = (AutoFeatureExtractor.from_pretrained(SER_MODEL),
+                    AutoModelForAudioClassification.from_pretrained(SER_MODEL).to(DEVICE).eval())
+    elif name == "text":
+        _M[name] = (AutoTokenizer.from_pretrained(TEXT_MODEL),
+                    AutoModelForSequenceClassification.from_pretrained(TEXT_MODEL).to(DEVICE).eval())
+    elif name == "asr":
+        _M[name] = pipeline("automatic-speech-recognition", model=ASR_MODEL, device=0 if DEVICE == "cuda" else -1)
+    return _M[name]
+
+
+@torch.no_grad()
+def _face_emotion(frames):
+    haar, (proc, m) = _get("haar"), _get("face")
+    crops = []
+    for fr in frames[::2]:
+        faces = haar.detectMultiScale(cv2.cvtColor(fr, cv2.COLOR_RGB2GRAY), 1.1, 5, minSize=(40, 40))
+        if len(faces):
+            x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
+            crops.append(fr[y:y + h, x:x + w])
+    if not crops:
+        return np.zeros(EMB, np.float32), 0, None
+    inp = proc(images=crops, return_tensors="pt").to(DEVICE)
+    out = m(**inp, output_hidden_states=True)
+    label = m.config.id2label[int(torch.softmax(out.logits, -1).mean(0).argmax())]
+    return out.hidden_states[-1][:, 0].mean(0).float().cpu().numpy(), len(crops), label
+
+
+@torch.no_grad()
+def _speech_emotion(y):
+    if len(y) < SR // 4:
+        return np.zeros(EMB, np.float32), None
+    fe, m = _get("speech")
+    inp = {k: v.to(DEVICE) for k, v in fe(y, sampling_rate=SR, return_tensors="pt").items()}
+    out = m(**inp, output_hidden_states=True)
+    return out.hidden_states[-1].mean(1)[0].float().cpu().numpy(), m.config.id2label[int(out.logits.argmax())]
+
+
+def _transcribe(y):
+    if len(y) < SR // 2 or float(np.sqrt((y ** 2).mean())) < 1e-3:  # silence: Whisper tends to invent text
+        return ""
+    r = _get("asr")({"raw": y, "sampling_rate": SR}, chunk_length_s=30,
+                    generate_kwargs={"language": "english", "task": "transcribe"})
+    return r["text"].strip()
+
+
+@torch.no_grad()
+def _text_emotion(text):
+    if not text:
+        return np.zeros(EMB, np.float32), None
+    tok, m = _get("text")
+    inp = tok(text, return_tensors="pt", truncation=True, max_length=128).to(DEVICE)
+    out = m(**inp, output_hidden_states=True)
+    return out.hidden_states[-1][0, 0].float().cpu().numpy(), m.config.id2label[int(out.logits.argmax())]
+
+
+def engineer_emotion_features(path, frames=None):
+    """-> (image_emotion[768], audio_emotion[768], text_emotion[768]) float32. Details in LAST_INFO."""
+    if frames is None:
+        frames = _sample_frames_uint8(path)
+    elif frames.dtype != np.uint8:
+        frames = np.uint8(np.clip(frames, 0, 1) * 255)
+    y, has = _load_wav(path)
+    ie, n_faces, face_label = _face_emotion(frames)
+    ae, ser_label = _speech_emotion(y) if has else (np.zeros(EMB, np.float32), None)
+    text = _transcribe(y) if has else ""
+    te, text_label = _text_emotion(text)
+    LAST_INFO.update(n_faces=n_faces, face_label=face_label, speech_label=ser_label, transcript=text,
+                     text_label=text_label, has_audio=bool(has))
+    return ie.astype(np.float32), ae.astype(np.float32), te.astype(np.float32)
+
+
+# ---------------- batch CLI ----------------
+def _save(path, **kw):
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        np.savez(f, **kw)
+    os.replace(tmp, path)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--splits_dir", default="splits")
+    ap.add_argument("--raw_root", required=True, help="folder containing the 4 category folders")
+    ap.add_argument("--out", default="processed_real")
+    ap.add_argument("--stage", choices=["va", "emo", "all"], default="all")
+    ap.add_argument("--limit", type=int, default=0, help="process only N videos (use to time a trial run)")
+    a = ap.parse_args()
+    os.makedirs(a.out, exist_ok=True)
+    rows = pd.concat([pd.read_csv(f"{a.splits_dir}/{s}.csv") for s in ("train", "val", "test")]).drop_duplicates("video_id")
+    fails, n, t0 = [], 0, time.time()
+    for r in tqdm(list(rows.itertuples()), desc="preprocessing"):
+        fva, femo = f"{a.out}/{r.video_id}.va.npz", f"{a.out}/{r.video_id}.emo.npz"
+        need_va = a.stage in ("va", "all") and not os.path.exists(fva)
+        need_emo = a.stage in ("emo", "all") and not os.path.exists(femo)
+        if not (need_va or need_emo):
             continue
-        label = 0 if cls == "RealVideo-RealAudio" else 1 
-        for video_file in os.listdir(cls_dir):
-            if not video_file.lower().endswith(('.mp4', '.avi', '.mov')):
-                continue
-            video_path = os.path.join(cls_dir, video_file)
-            sample_id = f"{cls}_{os.path.splitext(video_file)[0]}"
-            
-            v_feat = extract_video_features(video_path)
-            a_feat = extract_audio_features(video_path)
-            ie_feat, ae_feat, te_feat = engineer_emotion_features(v_feat)
-            
-            np.savez(f"processed_tensors/{sample_id}.npz", v=v_feat, a=a_feat, ie=ie_feat, ae=ae_feat, te=te_feat)
-            metadata.append({"sample_id": sample_id, "label": label})
-            print(f"Extracted: {sample_id}")
-            
-    pd.DataFrame(metadata).to_csv("metadata.csv", index=False)
-    print("Pre-processing Complete! metadata.csv ready.")
+        if a.limit and n >= a.limit:
+            break
+        n += 1
+        path = os.path.join(a.raw_root, r.rel_path)
+        try:
+            frames = _sample_frames_uint8(path)
+            if need_va:
+                _, has = _load_wav(path)
+                _save(fva, v=frames, a=extract_audio_features(path).astype(np.float16), has_audio=np.uint8(has))
+            if need_emo:
+                ie, ae, te = engineer_emotion_features(path, frames)
+                _save(femo, ie=ie, ae=ae, te=te, n_faces=LAST_INFO["n_faces"], transcript=np.array(LAST_INFO["transcript"]))
+        except Exception as e:
+            fails.append((r.video_id, repr(e)[:200]))
+    print(f"processed {n} videos in {time.time() - t0:.0f}s | failures: {len(fails)}")
+    if fails:
+        pd.DataFrame(fails, columns=["video_id", "error"]).to_csv(f"{a.out}/failures.csv", index=False)
+        print("see", f"{a.out}/failures.csv")
+    rep = [(r.label, int(np.load(f"{a.out}/{r.video_id}.va.npz")["has_audio"])) for r in rows.itertuples()
+            if os.path.exists(f"{a.out}/{r.video_id}.va.npz")]
+    if rep:
+        print("\nlabel (0=Real,1=Fake) vs has_audio (shortcut check):")
+        print(pd.crosstab(pd.Series([x[0] for x in rep], name="label"), pd.Series([x[1] for x in rep], name="has_audio")))
+
 
 if __name__ == "__main__":
-    process_full_dataset("./real_dataset_folder")
+    main()
